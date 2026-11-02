@@ -10,6 +10,9 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: AlleLabs_APK_Project_siap_download
     steps:
       - uses: actions/checkout@v4
 
@@ -31,7 +34,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: AlleLabs-APK
-          path: AlleLabs.apk
+          path: AlleLabs_APK_Project_siap_download/AlleLabs.apk
 
       - name: Publikasikan ke Releases
         env:
