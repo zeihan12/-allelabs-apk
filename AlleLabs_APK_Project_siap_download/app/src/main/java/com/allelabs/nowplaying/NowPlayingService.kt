@@ -1,6 +1,7 @@
 package com.allelabs.nowplaying
 
 import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
@@ -12,8 +13,11 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
@@ -21,6 +25,7 @@ import android.media.session.PlaybackState
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.service.notification.NotificationListenerService
 import android.util.Log
 import java.util.UUID
@@ -47,6 +52,10 @@ class NowPlayingService : NotificationListenerService() {
     private var writeChar: BluetoothGattCharacteristic? = null
     private var scanning = false
     private var lastSent = ""
+    private var receiverRegistered = false
+    private var scanStartedAt = 0L
+    private var gattStartedAt = 0L
+    private val scanRetry = Runnable { startScan() }
 
     private val listenerComponent by lazy { ComponentName(this, NowPlayingService::class.java) }
 
@@ -69,6 +78,7 @@ class NowPlayingService : NotificationListenerService() {
             } catch (e: SecurityException) {
                 Log.e(TAG, "Akses notifikasi belum diberikan", e)
             }
+            watchdog()
             main.postDelayed(this, 3000)
         }
     }
@@ -95,6 +105,10 @@ class NowPlayingService : NotificationListenerService() {
         } catch (e: SecurityException) {
             Log.e(TAG, "Gagal menambah listener sesi", e)
         }
+        if (!receiverRegistered) {
+            registerReceiver(btReceiver, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED))
+            receiverRegistered = true
+        }
         main.post(pollRunnable)
         startScan()
     }
@@ -104,6 +118,11 @@ class NowPlayingService : NotificationListenerService() {
         AppState.connected = false
         main.removeCallbacks(pollRunnable)
         main.removeCallbacks(pushRunnable)
+        main.removeCallbacks(scanRetry)
+        if (receiverRegistered) {
+            try { unregisterReceiver(btReceiver) } catch (_: Exception) {}
+            receiverRegistered = false
+        }
         try { sessionManager?.removeOnActiveSessionsChangedListener(sessionsListener) } catch (_: Exception) {}
         controller?.unregisterCallback(controllerCallback)
         controller = null
@@ -175,7 +194,7 @@ class NowPlayingService : NotificationListenerService() {
 
         override fun onScanFailed(errorCode: Int) {
             scanning = false
-            main.postDelayed({ startScan() }, 5000)
+            scheduleScan(5000)
         }
     }
 
@@ -185,19 +204,20 @@ class NowPlayingService : NotificationListenerService() {
             val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
             if (adapter == null || !adapter.isEnabled) {
                 AppState.bleStatus = "Bluetooth HP mati"
-                main.postDelayed({ startScan() }, 5000)
+                scheduleScan(5000)
                 return
             }
             val filter = ScanFilter.Builder().setDeviceName(DEVICE_NAME).build()
             val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_POWER).build()
             adapter.bluetoothLeScanner.startScan(listOf(filter), settings, scanCallback)
             scanning = true
+            scanStartedAt = SystemClock.elapsedRealtime()
             AppState.bleStatus = "Mencari keychain..."
         } catch (e: Exception) {
             // Biasanya izin Bluetooth belum diberikan: coba lagi nanti
             Log.w(TAG, "Scan gagal: ${e.message}")
             AppState.bleStatus = "Izin Bluetooth belum diberikan"
-            main.postDelayed({ startScan() }, 5000)
+            scheduleScan(5000)
         }
     }
 
@@ -212,19 +232,66 @@ class NowPlayingService : NotificationListenerService() {
 
     private fun connect(device: BluetoothDevice) {
         AppState.bleStatus = "Menyambung..."
+        gattStartedAt = SystemClock.elapsedRealtime()
         main.post {
             gatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
         }
     }
 
     private fun cleanupAndRescan(g: BluetoothGatt) {
-        g.close()
-        if (gatt === g) gatt = null
+        try { g.close() } catch (_: Exception) {}
+        if (gatt !== g) return          // koneksi lama, abaikan
+        gatt = null
         writeChar = null
         lastSent = ""
         AppState.connected = false
         AppState.bleStatus = "Mencari keychain..."
-        main.postDelayed({ startScan() }, 2000)
+        scheduleScan(2000)
+    }
+
+    private fun scheduleScan(delayMs: Long) {
+        main.removeCallbacks(scanRetry)
+        main.postDelayed(scanRetry, delayMs)
+    }
+
+    /** Buang semua status BLE lama (dipakai saat Bluetooth HP dimatikan/dinyalakan). */
+    private fun resetBle() {
+        stopScan()
+        scanning = false                 // scanner lama sudah tidak berlaku
+        try { gatt?.close() } catch (_: Exception) {}
+        gatt = null
+        writeChar = null
+        lastSent = ""
+        AppState.connected = false
+    }
+
+    private val btReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+            when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF -> {
+                    resetBle()
+                    AppState.bleStatus = "Bluetooth HP mati"
+                }
+                BluetoothAdapter.STATE_ON -> {
+                    resetBle()
+                    AppState.bleStatus = "Mencari keychain..."
+                    scheduleScan(1500)
+                }
+            }
+        }
+    }
+
+    /** Pengaman: kalau scan/koneksi macet, ulangi otomatis. */
+    private fun watchdog() {
+        val now = SystemClock.elapsedRealtime()
+        val g = gatt
+        if (g == null) {
+            if (!scanning) startScan()
+            else if (now - scanStartedAt > 20000) { stopScan(); startScan() }
+        } else if (!AppState.connected && now - gattStartedAt > 15000) {
+            cleanupAndRescan(g)
+        }
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
