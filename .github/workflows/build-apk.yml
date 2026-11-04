@@ -4,15 +4,9 @@ on:
   push:
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: AlleLabs_APK_Project_siap_download
     steps:
       - uses: actions/checkout@v4
 
@@ -28,20 +22,7 @@ jobs:
       - name: Build debug APK
         run: gradle assembleDebug --no-daemon
 
-      - name: Siapkan file APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk AlleLabs.apk
-
       - uses: actions/upload-artifact@v4
         with:
           name: AlleLabs-APK
-          path: AlleLabs_APK_Project_siap_download/AlleLabs.apk
-
-      - name: Publikasikan ke Releases
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release delete latest --yes --cleanup-tag || true
-          gh release create latest AlleLabs.apk \
-            --title "Alle Labs Now Playing (APK terbaru)" \
-            --notes "Unduh AlleLabs.apk di bawah, lalu instal di HP Android." \
-            --latest
+          path: app/build/outputs/apk/debug/app-debug.apk
