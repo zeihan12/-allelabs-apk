@@ -30,6 +30,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.service.notification.NotificationListenerService
 import android.util.Log
+import android.view.KeyEvent
 import java.text.Normalizer
 import java.util.TimeZone
 import java.util.UUID
@@ -72,6 +73,8 @@ class NowPlayingService : NotificationListenerService() {
     private var writeChar: BluetoothGattCharacteristic? = null
     private var cmdChar: BluetoothGattCharacteristic? = null
     private var pendingWriteChar: BluetoothGattCharacteristic? = null
+    private var rediscovered = false        // sudah coba refresh cache GATT pada koneksi ini
+    private var activated = false           // writeChar sudah diaktifkan pada koneksi ini
     private var lastDevice: BluetoothDevice? = null
     private var scanning = false
     private var lastSent = ""
@@ -286,17 +289,34 @@ class NowPlayingService : NotificationListenerService() {
 
     /** Perintah dari tombol keychain -> kontrol pemutar musik HP. */
     private fun handleRemoteCommand(cmd: Int) {
+        AppState.log("tombol diterima: 0x%02X".format(cmd))
         val c = controller
-        if (c == null) { AppState.log("tombol: tidak ada pemutar aktif"); return }
-        val tc = c.transportControls
-        when (cmd) {
-            CMD_TOGGLE_PLAY_PAUSE -> {
-                if (c.playbackState?.state == PlaybackState.STATE_PLAYING) tc.pause() else tc.play()
-                AppState.log("tombol: play/pause")
+        val playing = c?.playbackState?.state == PlaybackState.STATE_PLAYING
+        var ok = false
+        if (c != null) {
+            try {
+                val tc = c.transportControls
+                when (cmd) {
+                    CMD_TOGGLE_PLAY_PAUSE -> { if (playing) tc.pause() else tc.play(); ok = true }
+                    CMD_NEXT_TRACK -> { tc.skipToNext(); ok = true }
+                    CMD_PREVIOUS_TRACK -> { tc.skipToPrevious(); ok = true }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "transportControls gagal: ${e.message}")
             }
-            CMD_NEXT_TRACK -> { tc.skipToNext(); AppState.log("tombol: next") }
-            CMD_PREVIOUS_TRACK -> { tc.skipToPrevious(); AppState.log("tombol: previous") }
-            else -> return
+        }
+        if (!ok) {
+            // Cadangan: kirim tombol media seperti headset (jalan untuk pemutar apa pun)
+            val key = when (cmd) {
+                CMD_TOGGLE_PLAY_PAUSE -> KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
+                CMD_NEXT_TRACK -> KeyEvent.KEYCODE_MEDIA_NEXT
+                CMD_PREVIOUS_TRACK -> KeyEvent.KEYCODE_MEDIA_PREVIOUS
+                else -> return
+            }
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, key))
+            am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, key))
+            AppState.log("tombol: lewat media key")
         }
         main.postDelayed({ lastSent = ""; push() }, 400)
     }
@@ -317,7 +337,8 @@ class NowPlayingService : NotificationListenerService() {
     }
 
     private fun activateWriteChar(g: BluetoothGatt) {
-        if (g !== gatt) return
+        if (g !== gatt || activated) return
+        activated = true
         writeChar = pendingWriteChar
         lastSent = ""
         writeInFlight = false
@@ -397,6 +418,8 @@ class NowPlayingService : NotificationListenerService() {
         writeChar = null
         cmdChar = null
         pendingWriteChar = null
+        rediscovered = false
+        activated = false
         writeInFlight = false
         lastSent = ""
         scanning = false
@@ -453,14 +476,28 @@ class NowPlayingService : NotificationListenerService() {
                 AppState.bleStatus = "Firmware keychain belum diperbarui"
                 return
             }
-            val cmd = svc?.getCharacteristic(CMD_UUID)   // null di firmware lama -> tetap jalan tanpa tombol
+            val cmd = svc?.getCharacteristic(CMD_UUID)
             main.post {
                 if (g !== gatt) return@post
+                if (cmd == null && !rediscovered) {
+                    // Kemungkinan cache GATT Android masih versi lama: bersihkan lalu baca ulang sekali
+                    rediscovered = true
+                    AppState.log("char tombol belum terlihat, refresh cache...")
+                    refreshGattCache(g)
+                    main.postDelayed({ if (g === gatt) g.discoverServices() }, 800)
+                    return@post
+                }
                 pendingWriteChar = ch
                 if (cmd != null && enableCmdNotify(g, cmd)) {
                     cmdChar = cmd                        // lanjut di onDescriptorWrite
+                    // jaga-jaga kalau callback descriptor tidak pernah datang
+                    main.postDelayed({ if (g === gatt && !activated) {
+                        AppState.log("descriptor timeout, lanjut tanpa menunggu")
+                        activateWriteChar(g)
+                    } }, 2500)
                 } else {
-                    if (cmd == null) AppState.log("firmware lama: tombol remote tidak aktif")
+                    AppState.log(if (cmd == null) "TOMBOL TIDAK AKTIF: char 9ABC tidak ada (update firmware / matikan-nyalakan Bluetooth HP)"
+                                 else "TOMBOL TIDAK AKTIF: gagal subscribe notify")
                     activateWriteChar(g)
                 }
             }
@@ -474,11 +511,21 @@ class NowPlayingService : NotificationListenerService() {
             }
         }
 
+        // Android 13+ memanggil versi 3 parameter; Android lama memanggil versi 2 parameter.
+        override fun onCharacteristicChanged(
+            g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray
+        ) {
+            dispatchCmd(g, characteristic.uuid, value)
+        }
+
         @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
         override fun onCharacteristicChanged(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-            if (characteristic.uuid != CMD_UUID) return
-            val v = characteristic.value ?: return
-            if (v.isEmpty()) return
+            if (Build.VERSION.SDK_INT >= 33) return     // sudah ditangani versi 3 parameter
+            dispatchCmd(g, characteristic.uuid, characteristic.value)
+        }
+
+        private fun dispatchCmd(g: BluetoothGatt, uuid: UUID, v: ByteArray?) {
+            if (uuid != CMD_UUID || v == null || v.isEmpty()) return
             val cmd = v[0].toInt() and 0xFF
             main.post { if (g === gatt) handleRemoteCommand(cmd) }
         }
